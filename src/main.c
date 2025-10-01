@@ -3,6 +3,7 @@
 #include "icmp.h"
 #include "udp.h"
 #include "udp_reply.h"
+#include "tap.h"
 #include <stdio.h>
 #include <unistd.h>
 #include <stdint.h>
@@ -27,36 +28,58 @@ int main() {
         return 1;
     }
 
-    printf("TUN interface ready, fd=%d\n", tun_fd);
+    char ifname[IFNAMSIZ] = "tap0";
+    int tap_fd = tap_alloc(ifname);
+    if (tap_fd < 0) {
+        fprintf(stderr, "Failed to allocate TAP interface\n");
+        return 1;
+    }
 
     unsigned char buf[BUF_SIZE];
-    ssize_t nread;
+    ssize_t n_tun = 0, n_tap = 0;
+    fd_set rfds;
+    int maxfd = (tun_fd > tap_fd ? tun_fd : tap_fd) + 1;
 
     while (1) {
-        nread = read(tun_fd, buf, sizeof(buf));
-        if (nread < 0) {
-            perror("read");
+        FD_ZERO(&rfds);
+        FD_SET(tun_fd, &rfds);
+        FD_SET(tap_fd, &rfds);
+
+        int ret = select(maxfd, &rfds, NULL, NULL, NULL);
+        if (ret < 0) {
+            perror("select");
             break;
         }
-        if (nread == 0) continue; // пустой пакет
 
-        printf("\nRead %zd bytes\n", nread);
-        hexdump(buf, nread > DUMP_LIMIT ? DUMP_LIMIT : nread);
-        fflush(stdout);
+        if (FD_ISSET(tun_fd, &rfds)) {
+            n_tun = read(tun_fd, buf, sizeof(buf));
+            if (n_tun > 0) {
+                printf("\n[TUN] Read %zd bytes\n", n_tun);
+                hexdump(buf, n_tun > DUMP_LIMIT ? DUMP_LIMIT : n_tun);
+            }
+        }
+
+        if (FD_ISSET(tap_fd, &rfds)) {
+            n_tap = read(tap_fd, buf, sizeof(buf));
+            if (n_tap > 0) {
+                printf("\n[TAP] Read %zd bytes\n", n_tap);
+                hexdump(buf, n_tap > DUMP_LIMIT ? DUMP_LIMIT : n_tap);
+            }
+        }
 
         // Проверка на IPv4
-        if (is_ipv4(buf, nread)) {
-            parse_ipv4(buf, nread);
+        if (is_ipv4(buf, n_tun)) {
+            parse_ipv4(buf, n_tun);
 
             // ICMP
-            if (is_icmp(buf, nread)) {
-                handle_icmp(buf, nread, tun_fd);
+            if (is_icmp(buf, n_tun)) {
+                handle_icmp(buf, n_tun, tun_fd);
             }
 
             // UDP
-            if (is_udp(buf, nread)) {
-                handle_udp(buf, nread);
-                handle_udp_reply(buf, nread, tun_fd);
+            if (is_udp(buf, n_tun)) {
+                handle_udp(buf, n_tun);
+                handle_udp_reply(buf, n_tun, tun_fd);
             }
         } else {
             printf("Non-IPv4 packet, ignored\n");
